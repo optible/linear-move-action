@@ -57,11 +57,16 @@ query Issue($filter: IssueFilter) {
   }
 }`;
 
+const isLinearRateLimitError = (error) => {
+  const status = error?.status || error?.response?.status;
+  return status === 429 || /rate.?limit/i.test(error?.message || "");
+};
+
 const withLinearRateLimitRetry = async (request, retries = 3, delayMs = 1000) => {
   try {
     return await request();
   } catch (error) {
-    if (retries <= 1 || !error.message?.includes("Ratelimit exceeded")) {
+    if (retries <= 1 || !isLinearRateLimitError(error)) {
       throw error;
     }
 
