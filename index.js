@@ -57,6 +57,24 @@ query Issue($filter: IssueFilter) {
   }
 }`;
 
+const isLinearRateLimitError = (error) => {
+  const status = error?.status || error?.response?.status;
+  return status === 429 || /rate.?limit/i.test(error?.message || "");
+};
+
+const withLinearRateLimitRetry = async (request, retries = 3, delayMs = 1000) => {
+  try {
+    return await request();
+  } catch (error) {
+    if (retries <= 1 || !isLinearRateLimitError(error)) {
+      throw error;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return withLinearRateLimitRetry(request, retries - 1, delayMs * 2);
+  }
+};
+
 const findStates = (states, name) => {
   const names = name.split(",").map((n) => n.trim().toLowerCase());
   return states.filter((s) => names.includes(s.name.toLowerCase()));
@@ -91,20 +109,21 @@ const moveIssue =
     );
 
     if (!dry) {
-      await linearClient.updateIssue(issue.id, {
-        stateId: to.id,
-      });
+      await withLinearRateLimitRetry(() =>
+        linearClient.updateIssue(issue.id, {
+          stateId: to.id,
+        }),
+      );
     }
 
     return issue;
   };
 
 const getIssuesFromAttachments = (linearClient) => async (list) => {
-  const issuesResponse = await linearClient.client.rawRequest(
-    getIssuesFromAttachmentQuery,
-    {
+  const issuesResponse = await withLinearRateLimitRetry(() =>
+    linearClient.client.rawRequest(getIssuesFromAttachmentQuery, {
       filter: { url: { in: list } },
-    },
+    }),
   );
   const issues = issuesResponse.data.attachments.nodes.map((n) => n.issue);
 
@@ -118,11 +137,14 @@ const getIssuesFromAttachments = (linearClient) => async (list) => {
 };
 
 const getIssuesFromTerms = (linearClient) => async (list) => {
-  const issuesResponse = await Promise.all(
-    list.map((term) =>
-      linearClient.client.rawRequest(searchIssuesQuery, { term }),
-    ),
-  );
+  const issuesResponse = [];
+  for (const term of list) {
+    issuesResponse.push(
+      await withLinearRateLimitRetry(() =>
+        linearClient.client.rawRequest(searchIssuesQuery, { term }),
+      ),
+    );
+  }
   const issues = issuesResponse.map((r) => r.data.searchIssues.nodes).flat();
 
   console.debug(
@@ -148,7 +170,9 @@ const getIssuesFromUrls = (linearClient) => async (list) => {
         team: { key: { eq: team } },
         number: { eq: Number(number) },
       };
-      return linearClient.client.rawRequest(getIssuesQuery, { filter });
+      return withLinearRateLimitRetry(() =>
+        linearClient.client.rawRequest(getIssuesQuery, { filter }),
+      );
     }),
   );
   const issues = issuesResponse.map((r) => r.data.issues.nodes).flat();
@@ -168,13 +192,12 @@ const issuesMove = (linearClient) => async (issues, from, to, dry) => {
     .flatMap((s) => s.split(","))
     .map((s) => ({ name: { eqIgnoreCase: s.trim() } }));
 
-  const statesResponse = await linearClient.client.rawRequest(
-    getWorkflowStatesQuery,
-    {
+  const statesResponse = await withLinearRateLimitRetry(() =>
+    linearClient.client.rawRequest(getWorkflowStatesQuery, {
       filter: {
         or,
       },
-    },
+    }),
   );
   const states = statesResponse.data.workflowStates.nodes;
   console.debug(`"${from}" => "${to}": ${states.length} states total`);
